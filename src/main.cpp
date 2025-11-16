@@ -1,54 +1,37 @@
-// ===== RX for Arduino UNO (HC-12 + 13 relays, flexible mapping) =====
-#include <Arduino.h>
 #include <SoftwareSerial.h>
-#include <ctype.h>   // isxdigit
 
-// ---------- HC-12 ----------
-#define HC12_RX_PIN A0
-#define HC12_TX_PIN A1
-SoftwareSerial hc12(HC12_RX_PIN, HC12_TX_PIN);
-#define HC12_BAUD 9600
+// --- Настройки клавиш ---
+const byte NUM_KEYS = 13;
 
-// ---------- Конфигурация реле ----------
-struct RelayConfig {
-  char name;
-  byte pin;
+const char keyOrder[NUM_KEYS + 1] = "CBADEHGFZMOKT";
+const byte BTN_PINS[NUM_KEYS] = {
+  3, 6, 10, 8, 5, 2, 7, 11, 9, 4, 12, A2, A3
 };
 
-const RelayConfig relays[] = {
-  {'C', 2},
-  {'B', 3},
-  {'A', 4},
-  {'D', 5},
-  {'E', 6},
-  {'H', 7},
-  {'G', 8},
-  {'F', 9},
-  {'Z', 10},
-  {'M', 11},
-  {'O', 12},
-  {'K', A2},
-  {'T', A3}
-};
+// HC-12 на аналоговых пинах как цифровые (A0=14, A1=15)
+SoftwareSerial hc12(A0, A1); // RX, TX
 
-const byte RELAY_COUNT = sizeof(relays) / sizeof(relays[0]);
+// --- Тайминги ---
+const uint32_t DEBOUNCE_MS        = 30;    // антидребезг
+const uint32_t HOLD_INTERVAL      = 500;   // периодическая передача при удержании
+const uint32_t IDLE_BLINK_PERIOD  = 5000;  // каждые 5 секунд
+const uint32_t IDLE_BLINK_TIME    = 100;   // длительность каждой вспышки
+const uint32_t IDLE_BLINK_PAUSE   = 100;   // пауза между вспышками
 
-// LOW-активные модули
-const byte RELAY_ACTIVE_LEVEL   = LOW;
-const byte RELAY_INACTIVE_LEVEL = HIGH;
-
-// ---------- Индикация ----------
+// --- Светодиод ---
 const byte LED_PIN = 13;
-const bool LED_ACTIVE_HIGH = true;
 
-// ---------- Таймаут ----------
-#define RELAY_TIMEOUT_MS 500
+// --- Состояние клавиш ---
+bool     stablePressed[NUM_KEYS]    = {0};
+bool     lastReading[NUM_KEYS]      = {1};
+uint32_t lastDebounceTime[NUM_KEYS] = {0};
 
-// ---------- Внутренние ----------
-char rxBuf[32];       // небольшой запас
-byte rxIdx = 0;
-uint32_t lastCmdMs = 0;
-uint16_t lastMask = 0;
+// --- Прочее ---
+uint32_t lastSendTime = 0;
+
+// Для моргания в простое (двойная вспышка)
+uint32_t lastIdleBlink = 0;
+byte     blinkPhase    = 0;
 
 // ---------- CRC-8 (ATM/HEC) ----------
 static uint8_t crc8_atm(const uint8_t* data, size_t len) {
@@ -63,157 +46,156 @@ static uint8_t crc8_atm(const uint8_t* data, size_t len) {
   return crc;                      // no reflect, no xorout
 }
 
-// печать двухзначного HEX с ведущим нулём
-static void printHex2(uint8_t v) {
-  if (v < 0x10) Serial.print('0');
-  Serial.print(v, HEX);
+// --- Утилита: перевод nibbble в hex-символ ---
+static char nibbleToHex(uint8_t v) {
+  v &= 0x0F;
+  if (v < 10) return '0' + v;
+  return 'A' + (v - 10);
 }
 
-// ---------- Служебные функции ----------
-inline void setLed(bool on) {
-  digitalWrite(LED_PIN, LED_ACTIVE_HIGH ? (on ? HIGH : LOW)
-                                        : (on ? LOW  : HIGH));
+// --- Формируем payload "K:XXXX" ---
+static void buildPayload(char* buf, uint16_t mask) {
+  buf[0] = 'K';
+  buf[1] = ':';
+  // 4 hex-цифры, старшие сначала
+  buf[2] = nibbleToHex((mask >> 12) & 0x0F);
+  buf[3] = nibbleToHex((mask >> 8)  & 0x0F);
+  buf[4] = nibbleToHex((mask >> 4)  & 0x0F);
+  buf[5] = nibbleToHex((mask >> 0)  & 0x0F);
+  buf[6] = '\0'; // на всякий случай
 }
 
-inline void writeRelay(byte pin, bool on) {
-  digitalWrite(pin, on ? RELAY_ACTIVE_LEVEL : RELAY_INACTIVE_LEVEL);
+// --- Формируем пакет "K:XXXX*YY\n" ---
+static void buildPacket(char* packet, const char* payload, uint8_t crc) {
+  // payload всегда 6 символов: K:XXXX
+  packet[0] = payload[0];
+  packet[1] = payload[1];
+  packet[2] = payload[2];
+  packet[3] = payload[3];
+  packet[4] = payload[4];
+  packet[5] = payload[5];
+
+  packet[6] = '*';
+  packet[7] = nibbleToHex((crc >> 4) & 0x0F);
+  packet[8] = nibbleToHex(crc & 0x0F);
+  packet[9] = '\n';
+  packet[10] = '\0';
 }
 
-void applyRelayMask(uint16_t mask) {
-  for (byte i = 0; i < RELAY_COUNT; i++) {
-    bool on = (mask >> i) & 0x1;
-    writeRelay(relays[i].pin, on);
-  }
-}
-
-void allRelaysOff() {
-  applyRelayMask(0);
-}
-
-// ---------- Парсер команд с проверкой CRC ----------
-bool tryParseAndApply(const char* line) {
-  // trim ведущие пробелы
-  while (*line == ' ' || *line == '\t') line++;
-
-  // ожидаем "K:"
-  if (line[0] != 'K' || line[1] != ':') return false;
-
-  // ищем звёздочку-разделитель CRC
-  const char* star = strchr(line, '*');
-  if (!star) {
-    Serial.println(F("RX: no CRC separator '*'"));
-    return false;
-  }
-
-  // payload = все байты ДО '*', CRC считаем по ASCII payload
-  const uint8_t* payload = reinterpret_cast<const uint8_t*>(line);
-  size_t payload_len = (size_t)(star - line);
-
-  // читаем 2 hex-цифры CRC после '*'
-  if (!isxdigit((unsigned char)star[1]) || !isxdigit((unsigned char)star[2])) {
-    Serial.println(F("RX: CRC hex parse error"));
-    return false;
-  }
-  char crcHex[3] = { star[1], star[2], 0 };
-  uint8_t rx_crc = (uint8_t)strtoul(crcHex, nullptr, 16);
-
-  // считаем CRC по payload
-  uint8_t calc_crc = crc8_atm(payload, payload_len);
-
-  if (calc_crc != rx_crc) {
-    Serial.print(F("RX: CRC mismatch calc="));
-    printHex2(calc_crc);
-    Serial.print(F(" recv="));
-    printHex2(rx_crc);
-    Serial.println();
-    return false;
-  }
-
-  // успешная проверка CRC
-  Serial.print(F("RX: CRC OK calc="));
-  printHex2(calc_crc);
-  Serial.print(F(" recv="));
-  printHex2(rx_crc);
-  Serial.println();
-
-  // извлекаем маску из подстроки между "K:" и '*'
-  const char* maskStart = line + 2;         // после "K:"
-  size_t maskLen = (size_t)(star - maskStart);
-  if (maskLen == 0 || maskLen > 4) {        // передаётся %03X, но позволим до 4
-    Serial.println(F("RX: mask length error"));
-    return false;
-  }
-  char maskHex[5] = {0,0,0,0,0};
-  memcpy(maskHex, maskStart, maskLen);
-  uint16_t mask = (uint16_t)(strtoul(maskHex, nullptr, 16) & 0x1FFF);
-
-  // применяем
-  applyRelayMask(mask);
-  lastMask  = mask;
-  lastCmdMs = millis();
-  setLed(mask != 0);
-
-  // --- отладка ---
-  Serial.print(F("Mask: 0x"));
-  Serial.print(mask, HEX);
-  Serial.print(F("  Active: "));
-  bool any = false;
-  for (byte i = 0; i < RELAY_COUNT; i++) {
-    if ((mask >> i) & 1) {
-      any = true;
-      Serial.print(relays[i].name);
-      Serial.print(' ');
-    }
-  }
-  if (!any) Serial.print("none");
-  Serial.println();
-
-  return true;
-}
-
-// ---------- setup ----------
 void setup() {
-  Serial.begin(115200);
-  hc12.begin(HC12_BAUD);
+  Serial.begin(9600);
+  hc12.begin(9600);
+
+  for (byte i = 0; i < NUM_KEYS; i++) {
+    pinMode(BTN_PINS[i], INPUT_PULLUP);
+  }
 
   pinMode(LED_PIN, OUTPUT);
-  setLed(false);
-
-  // Инициализация реле
-  for (byte i = 0; i < RELAY_COUNT; i++) {
-    pinMode(relays[i].pin, OUTPUT);
-    writeRelay(relays[i].pin, false);
-    Serial.print(relays[i].name);
-    Serial.print(F(" → pin "));
-    Serial.println(relays[i].pin);
-  }
-
-  Serial.println(F("RX UNO ready (HC-12 + 13 relays, CRC-checked)"));
+  digitalWrite(LED_PIN, LOW);
 }
 
-// ---------- loop ----------
 void loop() {
-  // Приём построчно
-  while (hc12.available()) {
-    char c = (char)hc12.read();
-    if (c == '\n') {
-      rxBuf[rxIdx] = '\0';
-      tryParseAndApply(rxBuf);
-      rxIdx = 0;
-    } else if (c != '\r') {
-      if (rxIdx < (sizeof(rxBuf) - 1)) rxBuf[rxIdx++] = c;
-      else rxIdx = 0; // сброс при переполнении
+  uint16_t newState = 0;
+  bool changed = false;
+  bool anyPressed = false;
+
+  // --- Обработка кнопок ---
+  for (byte i = 0; i < NUM_KEYS; i++) {
+    bool reading = (digitalRead(BTN_PINS[i]) == LOW);
+
+    if (reading != lastReading[i]) {
+      lastDebounceTime[i] = millis();
+      lastReading[i] = reading;
+    }
+
+    if (millis() - lastDebounceTime[i] > DEBOUNCE_MS) {
+      if (reading != stablePressed[i]) {
+        stablePressed[i] = reading;
+        changed = true;
+
+        if (reading) {
+          Serial.print(F("Нажата: "));
+          Serial.println(keyOrder[i]);
+          Serial.write(keyOrder[i]);
+          Serial.write('\n');
+        } else {
+          Serial.print(F("Отпущена: "));
+          Serial.println(keyOrder[i]);
+        }
+      }
+    }
+
+    if (stablePressed[i]) {
+      newState |= (1U << i);  // 13 бит (0..12)
+      anyPressed = true;
     }
   }
 
-  // Таймаут — отключаем все реле
-  uint32_t now = millis();
-  if (now - lastCmdMs > RELAY_TIMEOUT_MS) {
-    if (lastMask != 0) {
-      allRelaysOff();
-      setLed(false);
-      lastMask = 0;
+  // --- Логика LED ---
+  if (anyPressed) {
+    // держим кнопку — LED горит постоянно
+    digitalWrite(LED_PIN, HIGH);
+
+    // активность сбрасывает таймер простоя/мигания
+    blinkPhase = 0;
+    lastIdleBlink = millis();
+
+  } else {
+    // сразу гасим LED после отпускания
+    // и переходим в режим простоя (двойная вспышка каждые 5 сек)
+    uint32_t now = millis();
+    switch (blinkPhase) {
+      case 0:
+        if (now - lastIdleBlink >= IDLE_BLINK_PERIOD) {
+          digitalWrite(LED_PIN, HIGH);
+          blinkPhase = 1;
+          lastIdleBlink = now;
+        }
+        break;
+      case 1:
+        if (now - lastIdleBlink >= IDLE_BLINK_TIME) {
+          digitalWrite(LED_PIN, LOW);
+          blinkPhase = 2;
+          lastIdleBlink = now;
+        }
+        break;
+      case 2:
+        if (now - lastIdleBlink >= IDLE_BLINK_PAUSE) {
+          digitalWrite(LED_PIN, HIGH);
+          blinkPhase = 3;
+          lastIdleBlink = now;
+        }
+        break;
+      case 3:
+        if (now - lastIdleBlink >= IDLE_BLINK_TIME) {
+          digitalWrite(LED_PIN, LOW);
+          blinkPhase = 0; // цикл завершён
+          lastIdleBlink = now;
+        }
+        break;
     }
-    lastCmdMs = now;
+  }
+
+  // --- Передача ---
+  bool heldEnough = (millis() - lastSendTime > HOLD_INTERVAL);
+
+  if (newState != 0 && (changed || heldEnough)) {
+    // маска по реальному числу клавиш (13 бит => 0x1FFF)
+    uint16_t mask = newState & ((1U << NUM_KEYS) - 1U);
+
+    char payload[7];   // "K:XXXX" + '\0'
+    char packet[16];   // "K:XXXX*YY\n" + запас
+
+    buildPayload(payload, mask);
+
+    // длина payload фиксированная — 6 байт
+    uint8_t crc = crc8_atm((const uint8_t*)payload, 6);
+
+    buildPacket(packet, payload, crc);
+
+    hc12.print(packet);
+    Serial.print(packet);
+
+    lastSendTime = millis();
   }
 }
